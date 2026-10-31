@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-from core import uid, now, fingerprint, execute
+from core import uid, now, fingerprint, execute, remove_checkout
 
 
 def git(folder, *args, **kwargs):
@@ -93,7 +93,7 @@ def listing(store,project):
         if row['state']=='passed':
             try:
                 if command!=row['command'] or fingerprint(Path(row['path']))!=row['fingerprint']:row['state']='stale'
-            except OSError:row['state']='unavailable'
+            except (OSError,ValueError):row['state']='unavailable'
     return result
 
 
@@ -117,3 +117,18 @@ def apply(store,id):
         db.execute("UPDATE integrations SET state='applied' WHERE id=?",(id,))
         store.event(db,p['id'],None,'integration.applied',{'id':id,'base':row['base'],'path':p['path']})
     return {'id':id,'state':'applied','path':p['path'],'message':'Изменения применены локально и находятся в Git index. Коммит и публикация не выполнялись.'}
+
+
+def remove(store,id,discard=False):
+    """Delete an integration worktree. Unapplied combined changes require explicit discard."""
+    setup(store)
+    with store.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row=db.execute('SELECT * FROM integrations WHERE id=?',(id,)).fetchone()
+        if not row or row['state']=='removed':raise ValueError('Сборка не найдена')
+        p=store.get(db,'projects',row['project'])
+        # Applied changes already live in the project index, so the copy is safe to drop.
+        kept=remove_checkout(p['path'],row['path'],'codex/integration-'+id,discard or row['state']=='applied')
+        db.execute("UPDATE integrations SET state='removed' WHERE id=?",(id,))
+        store.event(db,p['id'],None,'integration.removed',{'id':id,'previous':row['state'],'branch_kept':kept})
+    return {'id':id,'state':'removed','branch_kept':kept}

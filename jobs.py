@@ -6,7 +6,7 @@ import signal
 import subprocess
 import threading
 import time
-from core import now, uid, required, contract
+from core import now, uid, required, contract, process_state
 
 
 def codex_command():
@@ -31,9 +31,11 @@ def setup(store):
         for name in ('contract', 'usage'):
             if name not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
                 db.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+        if 'budget' not in {r[1] for r in db.execute('PRAGMA table_info(worker_config)')}:
+            db.execute('ALTER TABLE worker_config ADD COLUMN budget INTEGER NOT NULL DEFAULT 0')
 
 
-def configure(store, project, command, parallel=2, timeout=600):
+def configure(store, project, command, parallel=2, timeout=600, budget=None):
     setup(store)
     if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
         raise ValueError('Команда исполнителя должна быть массивом аргументов')
@@ -41,8 +43,48 @@ def configure(store, project, command, parallel=2, timeout=600):
         raise ValueError('Допустимо 1–4 исполнителя, 1–3600 секунд')
     with store.connect() as db:
         store.get(db, 'projects', project)
-        db.execute('INSERT OR REPLACE INTO worker_config VALUES(?,?,?,?)', (project, json.dumps(command), parallel, timeout))
-        store.event(db, project, None, 'worker.configured', {'parallel': parallel, 'timeout': timeout})
+        if budget is None:
+            old = db.execute('SELECT budget FROM worker_config WHERE project=?', (project,)).fetchone()
+            budget = old['budget'] if old else 0
+        db.execute('INSERT OR REPLACE INTO worker_config(project,command,parallel,timeout,budget) VALUES(?,?,?,?,?)',
+                   (project, json.dumps(command), parallel, timeout, budget))
+        store.event(db, project, None, 'worker.configured', {'parallel': parallel, 'timeout': timeout, 'budget': budget})
+
+
+def set_budget(store, project, tokens):
+    """Token ceiling for all worker runs of a project; 0 removes the ceiling."""
+    setup(store)
+    if not isinstance(tokens, int) or tokens < 0:
+        raise ValueError('Бюджет — неотрицательное число токенов (0 — без ограничения)')
+    with store.connect() as db:
+        store.get(db, 'projects', project)
+        if not db.execute('UPDATE worker_config SET budget=? WHERE project=?', (tokens, project)).rowcount:
+            raise ValueError('Сначала настройте исполнителя через CLI: worker-config')
+        store.event(db, project, None, 'worker.budget', {'budget': tokens})
+
+
+def spent(db, project):
+    """Tokens reported by finished workers. Runs without a usage report count as zero."""
+    total = 0
+    for (usage,) in db.execute("SELECT usage FROM jobs WHERE project=? AND usage!=''", (project,)):
+        try:
+            item = json.loads(usage)
+            total += int(item.get('input_tokens') or 0) + int(item.get('output_tokens') or 0)
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return total
+
+
+def status(store, project):
+    setup(store)
+    with store.connect() as db:
+        store.get(db, 'projects', project)
+        config = db.execute('SELECT parallel,timeout,budget FROM worker_config WHERE project=?', (project,)).fetchone()
+        used = spent(db, project)
+    if not config:
+        return {'configured': False, 'spent': used}
+    return dict(config) | {'configured': True, 'spent': used,
+                           'remaining': max(0, config['budget'] - used) if config['budget'] else None}
 
 
 def list_jobs(store, project):
@@ -66,6 +108,8 @@ def enqueue(store, node):
         config = db.execute('SELECT * FROM worker_config WHERE project=?', (n['project'],)).fetchone()
         if not config:
             raise ValueError('Сначала настройте исполнителя через CLI: worker-config')
+        if config['budget'] and spent(db, n['project']) >= config['budget']:
+            raise ValueError('Бюджет токенов исполнителей исчерпан. Увеличьте его через CLI: worker-budget')
         if not n['worktree'] or not Path(n['worktree']).is_dir():
             raise ValueError('Сначала создайте отдельную рабочую копию задачи')
         if db.execute("SELECT 1 FROM jobs WHERE node=? AND state IN ('queued','running','orphaned')", (node,)).fetchone():
@@ -101,8 +145,12 @@ def cancel(store, job):
 def claim(store):
     with store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
-        for row in db.execute("SELECT j.*,c.parallel FROM jobs j JOIN worker_config c ON c.project=j.project WHERE j.state='queued' ORDER BY j.created").fetchall():
+        for row in db.execute("SELECT j.*,c.parallel,c.budget FROM jobs j JOIN worker_config c ON c.project=j.project WHERE j.state='queued' ORDER BY j.created").fetchall():
             n = store.get(db, 'nodes', row['node'])
+            if row['budget'] and spent(db, row['project']) >= row['budget']:
+                db.execute("UPDATE jobs SET state='budget_exceeded',finished=? WHERE id=?", (now(), row['id']))
+                store.event(db, row['project'], row['node'], 'job.budget_exceeded', {'job': row['id'], 'budget': row['budget']})
+                continue
             if n['status'] in ('deferred','cancelled'):
                 db.execute("UPDATE jobs SET state='cancelled',cancel=1,finished=? WHERE id=?",(now(),row['id']))
                 store.event(db,row['project'],row['node'],'job.cancelled',{'job':row['id'],'node_status':n['status']})
@@ -244,35 +292,11 @@ def recover(store, job):
             raise ValueError('Восстановление доступно только для потерянного запуска')
         if not row['pid']:
             raise ValueError('PID не был сохранён. Нужна ручная проверка старых процессов; автоматический повтор заблокирован.')
-        if row['pid']:
-            if os.name == 'nt':
-                # os.kill(pid, 0) is not a portable existence probe on Windows.
-                import ctypes
-                from ctypes import wintypes
-                kernel = ctypes.WinDLL('kernel32', use_last_error=True)
-                kernel.OpenProcess.argtypes = [wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]
-                kernel.OpenProcess.restype = wintypes.HANDLE
-                kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE,ctypes.POINTER(wintypes.DWORD)]
-                kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-                handle = kernel.OpenProcess(0x1000,False,row['pid'])
-                if handle:
-                    code=wintypes.DWORD()
-                    try:
-                        if not kernel.GetExitCodeProcess(handle,ctypes.byref(code)) or code.value==259:
-                            raise ValueError('Старый PID ещё существует. Проверьте старое дерево процессов вручную.')
-                    finally:
-                        kernel.CloseHandle(handle)
-                elif ctypes.get_last_error()!=87:
-                    raise ValueError('Нельзя подтвердить остановку старого процесса')
-            else:
-                try:
-                    os.kill(row['pid'], 0)
-                except ProcessLookupError:
-                    pass
-                except OSError:
-                    raise ValueError('Нельзя подтвердить остановку старого процесса')
-                else:
-                    raise ValueError('Старый PID ещё существует. Проверьте и остановите старое дерево процессов вручную.')
+        state = process_state(row['pid'])
+        if state == 'alive':
+            raise ValueError('Старый PID ещё существует. Проверьте и остановите старое дерево процессов вручную.')
+        if state != 'gone':
+            raise ValueError('Нельзя подтвердить остановку старого процесса')
         db.execute("UPDATE jobs SET state='interrupted',finished=? WHERE id=?", (now(), job))
         store.event(db, row['project'], row['node'], 'job.recovered', {'job': job})
         return {'state': 'interrupted', 'message': 'Рабочая копия сохранена. Проверьте её перед повторной постановкой задачи.'}

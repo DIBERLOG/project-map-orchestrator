@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import time
@@ -11,7 +12,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parent
-KINDS = ('request', 'goal', 'question', 'decision', 'spec', 'instruction', 'task', 'fix', 'test')
+KINDS = ('request', 'goal', 'question', 'decision', 'spec', 'instruction', 'task', 'fix', 'test', 'prompt')
+CHAIN_LIMIT = 40
 STATES = ('planned', 'active', 'blocked', 'review', 'done', 'deferred', 'cancelled')
 
 
@@ -51,6 +53,8 @@ class Store:
                 db.execute("ALTER TABLE runs ADD COLUMN contract TEXT NOT NULL DEFAULT ''")
             if 'check_project' not in {r[1] for r in db.execute('PRAGMA table_info(nodes)')}:
                 db.execute("ALTER TABLE nodes ADD COLUMN check_project TEXT NOT NULL DEFAULT ''")
+            if 'owner_pid' not in {r[1] for r in db.execute('PRAGMA table_info(runs)')}:
+                db.execute('ALTER TABLE runs ADD COLUMN owner_pid INTEGER')
 
     @contextmanager
     def connect(self):
@@ -159,7 +163,96 @@ class Store:
             db.execute('UPDATE nodes SET ' + ','.join(f'{k}=?' for k in changes) + ',version=version+1,updated=? WHERE id=?',
                        (*changes.values(), now(), id))
             self.event(db, old['project'], id, 'node.updated', {'before': {k: old[k] for k in changes}, 'after': changes})
+            if old['kind'] == 'prompt' and 'status' in changes:
+                self.advance_chain(db, id)
             return self.get(db, 'nodes', id)
+
+    def create_chain(self, project, prompts, title='', parent=None):
+        """Store pasted prompts as one chain: root -> prompt 1 -> prompt 2 ... The first step is current."""
+        steps = split_prompts(prompts)
+        if not steps:
+            raise ValueError('Вставьте хотя бы один промт')
+        if len(steps) > CHAIN_LIMIT:
+            raise ValueError(f'В одной цепочке до {CHAIN_LIMIT} промтов')
+        if not isinstance(title, str) or len(title) > 200:
+            raise ValueError('Некорректное название цепочки')
+        date = now()
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self.get(db, 'projects', project)
+            if parent and self.get(db, 'nodes', parent)['project'] != project:
+                raise ValueError('Родитель должен принадлежать этому проекту')
+            root = uid()
+            name = title.strip() or f'Цепочка промтов · {len(steps)}'
+            db.execute('INSERT INTO nodes(id,project,kind,title,body,parent,status,created,updated) VALUES(?,?,?,?,?,?,?,?,?)',
+                       (root, project, 'request', name, f'{len(steps)} промтов выполняются по порядку.', parent or None, 'active', date, date))
+            ids, previous = [], root
+            for index, text in enumerate(steps):
+                id = uid()
+                line = ' '.join(text.split('\n', 1)[0].split())
+                db.execute('INSERT INTO nodes(id,project,kind,title,body,parent,status,created,updated) VALUES(?,?,?,?,?,?,?,?,?)',
+                           (id, project, 'prompt', f'{index + 1}. {line}'[:200], text, previous, 'active' if index == 0 else 'planned', date, date))
+                ids.append(id)
+                previous = id
+            self.event(db, project, root, 'chain.created', {'title': name, 'steps': len(steps)})
+            return {'root': root, 'steps': ids}
+
+    def chain_steps(self, db, id):
+        """Root (non-prompt head, may be None) and ordered prompt steps of the chain containing id."""
+        node = self.get(db, 'nodes', id)
+        guard = 0
+        while node['kind'] == 'prompt' and node['parent'] and guard < CHAIN_LIMIT + 5:
+            parent = self.get(db, 'nodes', node['parent'])
+            if parent['kind'] != 'prompt':
+                break
+            node, guard = parent, guard + 1
+        root = self.get(db, 'nodes', node['parent']) if node['kind'] == 'prompt' and node['parent'] else None
+        steps = [node] if node['kind'] == 'prompt' else []
+        while steps and len(steps) <= CHAIN_LIMIT:
+            following = db.execute("SELECT * FROM nodes WHERE parent=? AND kind='prompt' ORDER BY created,id LIMIT 1", (steps[-1]['id'],)).fetchone()
+            if not following:
+                break
+            steps.append(dict(following))
+        return root, steps
+
+    def advance_chain(self, db, id):
+        """After a step is answered or accepted, the next unfinished step becomes current."""
+        root, steps = self.chain_steps(db, id)
+        finished = ('review', 'done', 'cancelled')
+        current = next((s for s in steps if s['status'] not in finished + ('deferred',)), None)
+        if current and current['status'] == 'planned' and all(s['status'] in finished for s in steps[:steps.index(current)]):
+            db.execute("UPDATE nodes SET status='active',version=version+1,updated=? WHERE id=?", (now(), current['id']))
+            self.event(db, current['project'], current['id'], 'chain.advanced', {'from': id})
+        if root and root['status'] not in ('deferred', 'cancelled'):
+            live = [s for s in steps if s['status'] != 'cancelled']
+            target = ('done' if all(s['status'] == 'done' for s in live) else
+                      'review' if all(s['status'] in ('review', 'done') for s in live) else 'active') if live else root['status']
+            if target != root['status']:
+                db.execute('UPDATE nodes SET status=?,version=version+1,updated=? WHERE id=?', (target, now(), root['id']))
+                self.event(db, root['project'], root['id'], 'chain.status', {'status': target})
+
+    def current_chain_step(self, db, project, text):
+        """The current step whose prompt matches submitted text, or None. Never guesses on partial overlap."""
+        wanted = normalize(text)
+        if not wanted:
+            return None
+        for row in db.execute("SELECT * FROM nodes WHERE project=? AND kind='prompt' AND status IN ('active','planned') ORDER BY status='planned',created", (project,)).fetchall():
+            step = normalize(row['body'])
+            if step and (step == wanted or step in wanted):
+                if row['status'] == 'planned':
+                    previous = self.get(db, 'nodes', row['parent']) if row['parent'] else None
+                    if previous and previous['kind'] == 'prompt' and previous['status'] not in ('review', 'done', 'cancelled'):
+                        continue
+                return dict(row)
+        return None
+
+    def set_step_status(self, db, id, status, source):
+        node = self.get(db, 'nodes', id)
+        if node['kind'] != 'prompt' or node['status'] == status:
+            return
+        db.execute('UPDATE nodes SET status=?,version=version+1,updated=? WHERE id=?', (status, now(), id))
+        self.event(db, node['project'], id, 'node.updated', {'source': source, 'before': {'status': node['status']}, 'after': {'status': status}})
+        self.advance_chain(db, id)
 
     def depend(self, source, target):
         with self.connect() as db:
@@ -183,6 +276,15 @@ class Store:
                 self.event(db, a['project'], source, 'dependency.created', {'target': target})
         return {'ok': True}
 
+    def undepend(self, source, target):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            a = self.get(db, 'nodes', source)
+            if not db.execute('DELETE FROM edges WHERE source=? AND target=?', (source, target)).rowcount:
+                raise ValueError('Такой зависимости нет')
+            self.event(db, a['project'], source, 'dependency.removed', {'target': target})
+        return {'ok': True}
+
     def context(self, project, query='', limit=20):
         s = self.snapshot(project)
         query = query.casefold()
@@ -202,9 +304,33 @@ class Store:
             db.execute('UPDATE projects SET runner=? WHERE id=?', (json.dumps(command), project))
             self.event(db, project, None, 'runner.configured', {'command': command})
 
+    def recover_runs(self, db=None):
+        """Mark checks whose owning process is gone as interrupted, never as success."""
+        if db is None:
+            with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                return self.recover_runs(db)
+        recovered = []
+        for row in db.execute("SELECT * FROM runs WHERE status='running'").fetchall():
+            if row['owner_pid']:
+                lost = row['owner_pid'] != os.getpid() and process_state(row['owner_pid']) == 'gone'
+            else:
+                # Older records have no owner; the 60 second limit makes 10 minutes conclusive.
+                try:
+                    lost = time.time() - datetime.fromisoformat(row['created']).timestamp() > 600
+                except ValueError:
+                    lost = False
+            if lost:
+                db.execute("UPDATE runs SET status='interrupted',output=?,finished=? WHERE id=?",
+                           ('Проверка прервана: процесс завершился до получения результата.', now(), row['id']))
+                self.event(db, row['project'], row['node'], 'test.interrupted', {'run': row['id']})
+                recovered.append(row['id'])
+        return recovered
+
     def run_check(self, node):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            self.recover_runs(db)
             n = self.get(db, 'nodes', node)
             p = self.get(db, 'projects', n['check_project'] or n['project'])
             if n['worktree'] and p['id'] != n['project']:
@@ -216,8 +342,8 @@ class Store:
             if db.execute("SELECT 1 FROM runs WHERE (project=? OR cwd=?) AND status='running'", (n['project'], str(folder))).fetchone():
                 raise ValueError('В проекте уже выполняется проверка')
             stamp, id = fingerprint(folder), uid()
-            db.execute('INSERT INTO runs(id,project,node,command,cwd,status,fingerprint,created,contract) VALUES(?,?,?,?,?,?,?,?,?)',
-                       (id, n['project'], node, json.dumps(command), str(folder), 'running', stamp, now(), contract(n)))
+            db.execute('INSERT INTO runs(id,project,node,command,cwd,status,fingerprint,created,contract,owner_pid) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                       (id, n['project'], node, json.dumps(command), str(folder), 'running', stamp, now(), contract(n), os.getpid()))
             self.event(db, n['project'], node, 'test.started', {'run': id, 'check_project': p['id']})
         code, output, status = None, '', 'failed'
         try:
@@ -255,6 +381,101 @@ class Store:
             db.execute('UPDATE nodes SET worktree=?,version=version+1,updated=? WHERE id=?', (str(target), now(), node))
             self.event(db, p['id'], node, 'worktree.created', {'branch': branch, 'path': str(target)})
             return {'branch': branch, 'path': str(target)}
+
+    def remove_worktree(self, node, discard=False):
+        """Remove a task worktree. Unsaved worker changes require explicit discard."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            n = self.get(db, 'nodes', node)
+            p = self.get(db, 'projects', n['project'])
+            if not n['worktree']:
+                raise ValueError('У задачи нет рабочей копии')
+            if n['status'] == 'active':
+                raise ValueError('Задача в работе: сначала остановите исполнителя')
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone():
+                if db.execute("SELECT 1 FROM jobs WHERE node=? AND state IN ('queued','running','orphaned')", (node,)).fetchone():
+                    raise ValueError('Сначала завершите или восстановите запуск исполнителя')
+            kept = remove_checkout(p['path'], n['worktree'], 'codex/map-' + node, discard)
+            db.execute("UPDATE nodes SET worktree='',version=version+1,updated=? WHERE id=?", (now(), node))
+            self.event(db, p['id'], node, 'worktree.removed', {'path': n['worktree'], 'discarded': bool(discard), 'branch_kept': kept})
+            return {'removed': n['worktree'], 'branch_kept': kept}
+
+
+def process_state(pid):
+    """Return 'alive', 'gone' or 'unknown'. os.kill(pid, 0) is not a portable probe on Windows."""
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            return 'gone' if error == 87 else ('alive' if error == 5 else 'unknown')
+        code = wintypes.DWORD()
+        try:
+            if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return 'unknown'
+            return 'alive' if code.value == 259 else 'gone'
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return 'gone'
+    except PermissionError:
+        return 'alive'
+    except OSError:
+        return 'unknown'
+    return 'alive'
+
+
+def remove_checkout(source, path, branch, discard):
+    """Remove a pmap worktree and its branch when safe. Returns the branch name if it was kept."""
+    folder = Path(path)
+    def git(*args):
+        return subprocess.run(['git', '-C', str(source), *args], capture_output=True, text=True, timeout=60)
+    if folder.is_dir():
+        status = subprocess.run(['git', '-C', str(folder), 'status', '--porcelain'], capture_output=True, text=True, timeout=15)
+        if status.returncode:
+            raise ValueError('Не удалось проверить рабочую копию: ' + status.stderr[-1000:])
+        if status.stdout.strip() and not discard:
+            raise ValueError('В рабочей копии есть изменения. Подтвердите удаление вместе с изменениями.')
+        result = git('worktree', 'remove', *(['--force'] if discard else []), str(folder))
+        if result.returncode:
+            raise ValueError(result.stderr[-2000:])
+    else:
+        git('worktree', 'prune')
+    # -d refuses to drop commits that exist only on this branch; such a branch is kept.
+    if git('branch', '-d', branch).returncode == 0 or not git('rev-parse', '--verify', '--quiet', 'refs/heads/' + branch).stdout.strip():
+        return ''
+    return branch
+
+
+def normalize(text):
+    return ' '.join(str(text or '').split()).casefold()
+
+
+def split_prompts(text):
+    """Lines of '---' separate prompts; otherwise blank lines; otherwise every line is a prompt."""
+    if not isinstance(text, str) or len(text) > 200000:
+        raise ValueError('Текст цепочки должен быть строкой до 200000 символов')
+    text = text.replace('\r\n', '\n').strip()
+    if re.search(r'^\s*-{3,}\s*$', text, re.M):
+        parts = re.split(r'^\s*-{3,}\s*$', text, flags=re.M)
+    elif re.search(r'\n\s*\n', text):
+        parts = re.split(r'\n\s*\n', text)
+    else:
+        parts = text.split('\n')
+    result = []
+    for part in parts:
+        part = re.sub(r'^\s*(?:\d{1,3}[.)]|[-*•])\s+', '', part.strip(), count=1).strip()
+        if part:
+            result.append(part[:19000])
+    return result
 
 
 def contract(node):

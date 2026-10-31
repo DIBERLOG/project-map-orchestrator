@@ -94,17 +94,31 @@ def capture(store, payload):
         db.execute('BEGIN IMMEDIATE')
         db.execute('CREATE TABLE IF NOT EXISTS hook_events(identity TEXT PRIMARY KEY,project TEXT NOT NULL,turn_key TEXT NOT NULL,node TEXT,event TEXT NOT NULL)')
         old = db.execute('SELECT node FROM hook_events WHERE identity=?', (identity,)).fetchone()
+        step = None
         if old:
             node = old['node']
         else:
             parent = db.execute("SELECT node FROM hook_events WHERE project=? AND turn_key=? AND event='UserPromptSubmit' ORDER BY rowid DESC LIMIT 1", (project['id'], turn_key)).fetchone()
-            node = uid() if kind else None
-            if node:
+            if event == 'UserPromptSubmit':
+                # A prompt sent from a chain is that step, not a new request.
+                step = store.current_chain_step(db, project['id'], user_text)
+            if event == 'Stop' and parent and parent['node']:
+                answered = db.execute("SELECT id FROM nodes WHERE id=? AND kind='prompt' AND status='active'", (parent['node'],)).fetchone()
+                if answered:
+                    store.set_step_status(db, answered['id'], 'review', 'codex-hook')
+            node = step['id'] if step else (uid() if kind else None)
+            if step:
+                store.set_step_status(db, node, 'active', 'codex-hook')
+                kind = 'prompt'
+            elif node:
                 date = now()
                 db.execute('INSERT INTO nodes(id,project,kind,title,body,parent,created,updated) VALUES(?,?,?,?,?,?,?,?)',
                            (node, project['id'], kind, title, body, parent['node'] if parent and kind == 'fix' else None, date, date))
             db.execute('INSERT INTO hook_events(identity,project,turn_key,node,event) VALUES(?,?,?,?,?)', (identity, project['id'], turn_key, node, event))
-            store.event(db, project['id'], node, f'{kind}.created' if kind else 'turn.finished', {'source': 'codex-hook', 'event': event, 'session': session, 'turn': turn, 'title': title})
+            store.event(db, project['id'], node, 'chain.prompt_sent' if step else (f'{kind}.created' if kind else 'turn.finished'), {'source': 'codex-hook', 'event': event, 'session': session, 'turn': turn, 'title': step['title'] if step else title})
+    if step:
+        return {'hookSpecificOutput': {'hookEventName': event, 'additionalContext':
+            f'This request is step "{step["title"]}" (node {node}) of a Project Map prompt chain. Do not record it again. When this turn ends the step is marked for review and the next prompt becomes current. Record tasks and fixes with parent={node}. Hook capture does not establish completion.'}}
     if event == 'UserPromptSubmit':
         return {'hookSpecificOutput': {'hookEventName': event, 'additionalContext':
             f'Project Map captured this request as node {node} in project {project["id"]}. Do not duplicate the request. Record its tasks and corrections with map_create_node, parent={node}; update outcomes with map_update_node. Use only relevant map_context. Hook capture does not establish task completion.'}}
