@@ -1,0 +1,8 @@
+{
+  "description": "Project Map: local capture for registered project folders only. Review and trust before use.",
+  "hooks": {
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python \"${PLUGIN_ROOT}/capture.py\"", "commandWindows": "python \"$env:PLUGIN_ROOT/capture.py\"", "timeout": 10}]}],
+    "PostToolUse": [{"matcher": "^apply_patch$", "hooks": [{"type": "command", "command": "python \"${PLUGIN_ROOT}/capture.py\"", "commandWindows": "python \"$env:PLUGIN_ROOT/capture.py\"", "timeout": 10}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "python \"${PLUGIN_ROOT}/capture.py\"", "commandWindows": "python \"$env:PLUGIN_ROOT/capture.py\"", "timeout": 10}]}]
+  }
+}

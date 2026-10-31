@@ -1,0 +1,13 @@
+data/
+__pycache__/
+*.pyc
+outputs/
+.worktrees/
+.codex/hooks.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.venv/
+node_modules/
